@@ -30,8 +30,11 @@ Extended usage:
 
 import argparse
 import contextlib
+import http.client
 import threading
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 import subprocess
 
 import pandas as pd
@@ -96,6 +99,39 @@ def build_driver(headless: bool) -> webdriver.Chrome:
         options.add_argument("--headless=new")
     service = Service()
     return webdriver.Chrome(service=service, options=options)
+
+
+def _is_service_available(url: str, timeout: int) -> bool:
+    """Return True when the URL responds without connection errors."""
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return True
+
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    try:
+        conn = conn_cls(parsed.hostname, port, timeout=timeout)
+        conn.request("HEAD", parsed.path or "/")
+        conn.getresponse()
+        return True
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def wait_for_service(url: str, timeout: int, interval: float = 1.0) -> bool:
+    """Poll a URL until it responds or the timeout elapses."""
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _is_service_available(url, timeout=timeout):
+            return True
+        time.sleep(interval)
+    return False
 
 
 def _normalize_key(value: str) -> str:
@@ -346,6 +382,12 @@ def parse_args():
         help="Comma-separated CSS selectors for buttons to click after completion.",
     )
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for completion before failing.")
+    parser.add_argument(
+        "--service-wait",
+        type=int,
+        default=40,
+        help="Seconds to wait for the target URL to start responding before launching the browser.",
+    )
     parser.add_argument("--headless", action="store_true", help="Run Chrome in headless mode.")
     return parser.parse_args()
 
@@ -360,6 +402,16 @@ def main():
     if args.worker:
         process, completion_event, stream_thread = launch_worker(
             args.worker, args.completion_marker, log_path, args.worker_cwd
+        )
+
+    if not wait_for_service(args.url, args.service_wait):
+        if process:
+            process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+        raise RuntimeError(
+            "The target service did not respond within the allotted time. "
+            "Start the web app (or set --url to a reachable address) before running this script."
         )
 
     driver = build_driver(args.headless)
