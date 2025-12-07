@@ -36,6 +36,7 @@ import subprocess
 
 import pandas as pd
 from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -205,11 +206,13 @@ def fill_fields(driver: webdriver.Chrome, first_locator, second_locator, submit_
     submit_element.send_keys(Keys.ENTER)
 
 
-def wait_for_completion(driver: webdriver.Chrome, condition, process_event: threading.Event, timeout: int):
+def wait_for_completion(
+    driver: webdriver.Chrome, condition, process_event: threading.Event | None, timeout: int
+):
     """Wait until either the DOM condition is met or the worker signals completion."""
 
     def _either(driver_obj):
-        if process_event.is_set():
+        if process_event and process_event.is_set():
             return "process"
         result = condition(driver_obj)
         if result:
@@ -243,9 +246,9 @@ def parse_args():
     parser.add_argument(
         "--worker",
         required=False,
-        default="python -m uvicorn main:app --reload",
+        default=None,
         help=(
-            "Command to run the worker Python program (default matches the provided uvicorn invocation)."
+            "Command to run the worker Python program. When omitted, the script will not launch a worker process."
         ),
     )
     parser.add_argument(
@@ -260,8 +263,10 @@ def parse_args():
     parser.add_argument(
         "--completion-marker",
         required=False,
-        default="Report written to outputs/",
-        help="Text that signals completion in worker output.",
+        default=None,
+        help=(
+            "Text that signals completion in worker output. Only used when a worker command is provided."
+        ),
     )
     parser.add_argument("--log-path", type=Path, default=None, help="File path to write worker logs.")
     parser.add_argument(
@@ -348,13 +353,27 @@ def parse_args():
 def main():
     args = parse_args()
 
+    process = None
+    completion_event = None
+    stream_thread = None
     log_path = args.log_path if args.log_path else None
-    process, completion_event, stream_thread = launch_worker(
-        args.worker, args.completion_marker, log_path, args.worker_cwd
-    )
+    if args.worker:
+        process, completion_event, stream_thread = launch_worker(
+            args.worker, args.completion_marker, log_path, args.worker_cwd
+        )
 
     driver = build_driver(args.headless)
-    driver.get(args.url)
+    try:
+        driver.get(args.url)
+    except WebDriverException as exc:
+        driver.quit()
+        if process:
+            process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+        raise RuntimeError(
+            f"Failed to open {args.url}. Ensure the target service is running or provide a reachable --url."
+        ) from exc
 
     first_locator = css_locator(args.first_field)
     second_locator = css_locator(args.second_field)
@@ -394,11 +413,13 @@ def main():
             args.output_excel,
         )
     finally:
-        process.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=5)
+        if process:
+            process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
         driver.quit()
-        stream_thread.join(timeout=1)
+        if stream_thread:
+            stream_thread.join(timeout=1)
 
 
 if __name__ == "__main__":
