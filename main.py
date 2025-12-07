@@ -97,13 +97,74 @@ def build_driver(headless: bool) -> webdriver.Chrome:
     return webdriver.Chrome(service=service, options=options)
 
 
-def read_excel_rows(excel_path: Path, first_column: str, second_column: str):
-    """Yield (index, first_value, second_value) from the specified Excel columns."""
+def _normalize_key(value: str) -> str:
+    return value.strip().lower()
+
+
+def build_link_map(link_excel_path: Path, name_column: str, domain_column: str) -> dict[str, str]:
+    """Load link groups into a lookup of normalized name -> domain string."""
+
+    df = pd.read_excel(link_excel_path)
+    if name_column not in df.columns or domain_column not in df.columns:
+        raise ValueError(
+            f"Missing required columns '{name_column}' or '{domain_column}' in {link_excel_path}"
+        )
+
+    link_map: dict[str, str] = {}
+    for _, row in df.iterrows():
+        raw_name = row[name_column]
+        if pd.isna(raw_name):
+            continue
+
+        normalized_name = _normalize_key(str(raw_name))
+        domain_value = row[domain_column]
+        link_map[normalized_name] = "" if pd.isna(domain_value) else str(domain_value)
+    return link_map
+
+
+def read_excel_rows(
+    excel_path: Path,
+    first_column: str,
+    second_column: str,
+    link_map: dict[str, str] | None = None,
+    split_delimiter: str = ",",
+):
+    """Yield (index, first_value, second_value) from the specified Excel columns.
+
+    When a link map is provided, values in the second column can be comma-separated
+    group names. Each group will emit its own tuple with the mapped domain string,
+    enabling scenarios like running both consulting and academic domain queries for
+    a single topic row.
+    """
+
     df = pd.read_excel(excel_path)
+    if first_column not in df.columns or second_column not in df.columns:
+        raise ValueError(
+            f"Missing required columns '{first_column}' or '{second_column}' in {excel_path}"
+        )
+
     for idx, row in df.iterrows():
         first_value = row[first_column]
-        second_value = row[second_column]
-        yield idx, "" if pd.isna(first_value) else str(first_value), "" if pd.isna(second_value) else str(second_value)
+        first_text = "" if pd.isna(first_value) else str(first_value)
+        raw_second = row[second_column]
+
+        if link_map is None:
+            second_text = "" if pd.isna(raw_second) else str(raw_second)
+            yield idx, first_text, second_text
+            continue
+
+        if pd.isna(raw_second):
+            yield idx, first_text, ""
+            continue
+
+        groups = [group.strip() for group in str(raw_second).split(split_delimiter) if group.strip()]
+        if not groups:
+            yield idx, first_text, str(raw_second)
+            continue
+
+        for group in groups:
+            mapped_value = link_map.get(_normalize_key(group))
+            yield idx, first_text, mapped_value if mapped_value is not None else group
 
 
 def write_status_updates(
@@ -203,9 +264,43 @@ def parse_args():
         help="Text that signals completion in worker output.",
     )
     parser.add_argument("--log-path", type=Path, default=None, help="File path to write worker logs.")
-    parser.add_argument("--excel-path", type=Path, required=True, help="Path to the Excel file with input data.")
-    parser.add_argument("--first-column", required=True, help="Excel column for the first field value.")
-    parser.add_argument("--second-column", required=True, help="Excel column for the second field value.")
+    parser.add_argument(
+        "--excel-path",
+        type=Path,
+        default=Path("input/topics.xlsx"),
+        help="Path to the Excel file with input data (topics by default).",
+    )
+    parser.add_argument(
+        "--first-column",
+        default="Research Topics",
+        help="Excel column for the first field value (topic).",
+    )
+    parser.add_argument(
+        "--second-column",
+        default="Links",
+        help="Excel column for the second field value or link group names.",
+    )
+    parser.add_argument(
+        "--link-excel-path",
+        type=Path,
+        default=Path("input/links.xlsx"),
+        help="Optional Excel path that maps link group names to domain lists.",
+    )
+    parser.add_argument(
+        "--link-name-column",
+        default="Link Group Name",
+        help="Column in the link map Excel that identifies each group name.",
+    )
+    parser.add_argument(
+        "--link-domain-column",
+        default="Domains",
+        help="Column in the link map Excel that contains domains for each group.",
+    )
+    parser.add_argument(
+        "--link-delimiter",
+        default=",",
+        help="Delimiter used to split multiple link group names in the topic sheet.",
+    )
     parser.add_argument(
         "--status-column",
         default="Status",
@@ -272,20 +367,28 @@ def main():
 
     button_locators = parse_button_selectors(args.final_buttons)
 
-    processed_indices: list[int] = []
+    link_map = None
+    if args.link_excel_path:
+        link_map = build_link_map(args.link_excel_path, args.link_name_column, args.link_domain_column)
+
+    processed_indices: set[int] = set()
 
     try:
         for idx, first_value, second_value in read_excel_rows(
-            args.excel_path, args.first_column, args.second_column
+            args.excel_path,
+            args.first_column,
+            args.second_column,
+            link_map=link_map,
+            split_delimiter=args.link_delimiter,
         ):
             fill_fields(driver, first_locator, second_locator, submit_locator, first_value, second_value)
-            processed_indices.append(idx)
+            processed_indices.add(idx)
 
         wait_for_completion(driver, completion_condition, completion_event, args.timeout)
         finish_workflow(driver, button_locators)
         write_status_updates(
             args.excel_path,
-            processed_indices,
+            sorted(processed_indices),
             args.status_column,
             args.status_value,
             args.output_excel,
